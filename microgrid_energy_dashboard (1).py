@@ -35,6 +35,8 @@ MATHEMATICAL FOUNDATION:
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import plotly.graph_objects as go
+import networkx as nx
 from datetime import datetime, timedelta
 import streamlit as st
 st.set_page_config(layout="wide", page_title="Microgrid Energy Optimization")
@@ -64,6 +66,17 @@ FINAL_SOC_PCT = 0.50
 
 # Solar capacity (installed)
 SOLAR_CAPACITY_KWP = 30.0
+
+# Multi-objective dispatch parameters (cost and emissions per kWh)
+SOLAR_COST_PER_KWH = 0.01
+BATTERY_COST_PER_KWH = 0.03
+DIESEL_COST_PER_KWH = 0.35
+
+SOLAR_EMISSIONS_KG_PER_KWH = 0.0
+BATTERY_EMISSIONS_KG_PER_KWH = 0.05
+DIESEL_EMISSIONS_KG_PER_KWH = 0.75
+
+MAX_DIESEL_POWER_KW = 120.0
 
 def generate_solar_profile():
     """Realistic solar generation profile (bell curve peaking at noon)."""
@@ -287,6 +300,392 @@ def build_optimize_microgrid_model(load, solar, price, battery_cap, charge_power
     return results, prob
 
 
+def solve_multiobjective_dispatch(load, solar, battery_cap, charge_power, discharge_power,
+                                  init_soc, final_soc, alpha, diesel_power_max,
+                                  cost_factors, emission_factors):
+    """Solve weighted-sum multi-objective dispatch (cost vs emissions)."""
+    prob = pulp.LpProblem("Multiobjective_Dispatch", pulp.LpMinimize)
+
+    solar_use = {t: pulp.LpVariable(f"solar_use_{t}", lowBound=0, upBound=solar[t], cat='Continuous')
+                 for t in TIME_STEPS}
+    diesel = {t: pulp.LpVariable(f"diesel_{t}", lowBound=0, upBound=diesel_power_max, cat='Continuous')
+              for t in TIME_STEPS}
+    charge = {t: pulp.LpVariable(f"m_charge_{t}", lowBound=0, cat='Continuous')
+              for t in TIME_STEPS}
+    discharge = {t: pulp.LpVariable(f"m_discharge_{t}", lowBound=0, cat='Continuous')
+                 for t in TIME_STEPS}
+    soc = {t: pulp.LpVariable(f"m_soc_{t}", lowBound=0, upBound=battery_cap, cat='Continuous')
+           for t in TIME_STEPS}
+
+    cost = pulp.lpSum(
+        cost_factors["solar"] * solar_use[t]
+        + cost_factors["battery"] * discharge[t]
+        + cost_factors["diesel"] * diesel[t]
+        for t in TIME_STEPS
+    )
+    emissions = pulp.lpSum(
+        emission_factors["solar"] * solar_use[t]
+        + emission_factors["battery"] * discharge[t]
+        + emission_factors["diesel"] * diesel[t]
+        for t in TIME_STEPS
+    )
+
+    prob += alpha * cost + (1 - alpha) * emissions, "Weighted_Objective"
+
+    for t in TIME_STEPS:
+        prob += (
+            solar_use[t] + diesel[t] + discharge[t] == load[t] + charge[t],
+            f"mo_energy_balance_{t}"
+        )
+
+        if t < HOURS - 1:
+            prob += (
+                soc[t+1] == soc[t] + CHARGE_EFFICIENCY * charge[t]
+                - (1 / DISCHARGE_EFFICIENCY) * discharge[t],
+                f"mo_soc_transition_{t}"
+            )
+
+        prob += (charge[t] <= charge_power, f"mo_charge_limit_{t}")
+        prob += (discharge[t] <= discharge_power, f"mo_discharge_limit_{t}")
+
+    prob += (soc[0] == init_soc * battery_cap, "mo_initial_soc")
+    prob += (soc[HOURS - 1] >= final_soc * battery_cap, "mo_final_soc")
+
+    solver = pulp.PULP_CBC_CMD(msg=0, timeLimit=30)
+    prob.solve(solver)
+
+    results = {
+        "status": pulp.LpStatus[prob.status],
+        "cost": pulp.value(cost),
+        "emissions": pulp.value(emissions),
+        "solar_use": {t: pulp.value(solar_use[t]) for t in TIME_STEPS},
+        "diesel": {t: pulp.value(diesel[t]) for t in TIME_STEPS},
+        "discharge": {t: pulp.value(discharge[t]) for t in TIME_STEPS},
+    }
+
+    return results
+
+
+def simulate_dispatch(load, solar, battery_cap, charge_power, discharge_power,
+                      init_soc, final_soc, diesel_power_max, discharge_schedule=None):
+    """Simulate dispatch with optional battery discharge schedule."""
+    soc = init_soc * battery_cap
+    solar_use = np.zeros(HOURS)
+    battery_discharge = np.zeros(HOURS)
+    diesel_use = np.zeros(HOURS)
+    unmet = np.zeros(HOURS)
+
+    for t in TIME_STEPS:
+        demand = load[t]
+        solar_available = solar[t]
+
+        solar_to_load = min(solar_available, demand)
+        solar_use[t] = solar_to_load
+        demand -= solar_to_load
+
+        # Battery discharge decision
+        if discharge_schedule is None:
+            discharge_target = min(demand, discharge_power)
+        else:
+            discharge_target = min(discharge_schedule[t], discharge_power, demand)
+
+        max_discharge_by_soc = soc * DISCHARGE_EFFICIENCY
+        discharge_actual = min(discharge_target, max_discharge_by_soc)
+        battery_discharge[t] = discharge_actual
+        soc -= discharge_actual / DISCHARGE_EFFICIENCY
+        demand -= discharge_actual
+
+        # Diesel meets remaining demand
+        diesel_actual = min(demand, diesel_power_max)
+        diesel_use[t] = diesel_actual
+        demand -= diesel_actual
+
+        if demand > 0:
+            unmet[t] = demand
+
+        # Charge from leftover solar
+        solar_surplus = solar_available - solar_to_load
+        if solar_surplus > 0:
+            charge_limit = min(charge_power, solar_surplus)
+            capacity_remaining = battery_cap - soc
+            max_charge_by_soc = capacity_remaining / CHARGE_EFFICIENCY
+            charge_actual = min(charge_limit, max_charge_by_soc)
+            soc += charge_actual * CHARGE_EFFICIENCY
+
+    reliability = 100.0 * (1.0 - np.mean(unmet > 1e-6))
+
+    return {
+        "solar_use": solar_use,
+        "battery_discharge": battery_discharge,
+        "diesel_use": diesel_use,
+        "unmet": unmet,
+        "reliability": reliability
+    }
+
+
+def evaluate_dispatch_costs(dispatch, cost_factors, emission_factors):
+    """Compute total cost and emissions for a dispatch outcome."""
+    cost = (
+        cost_factors["solar"] * np.sum(dispatch["solar_use"])
+        + cost_factors["battery"] * np.sum(dispatch["battery_discharge"])
+        + cost_factors["diesel"] * np.sum(dispatch["diesel_use"])
+    )
+    emissions = (
+        emission_factors["solar"] * np.sum(dispatch["solar_use"])
+        + emission_factors["battery"] * np.sum(dispatch["battery_discharge"])
+        + emission_factors["diesel"] * np.sum(dispatch["diesel_use"])
+    )
+    return cost, emissions
+
+
+def run_ga_dispatch(load, solar, battery_cap, charge_power, discharge_power,
+                    init_soc, final_soc, diesel_power_max, cost_factors,
+                    emission_factors, population_size=50, generations=100):
+    """Simple GA for battery discharge schedule optimization."""
+    rng = np.random.default_rng(42)
+    gene_len = HOURS
+
+    def init_individual():
+        return rng.uniform(0, discharge_power, size=gene_len)
+
+    def fitness(individual):
+        dispatch = simulate_dispatch(
+            load, solar, battery_cap, charge_power, discharge_power,
+            init_soc, final_soc, diesel_power_max, discharge_schedule=individual
+        )
+        cost, emissions = evaluate_dispatch_costs(dispatch, cost_factors, emission_factors)
+        unmet = np.sum(dispatch["unmet"])
+        penalty = 1000.0 * unmet
+        return cost + penalty
+
+    population = [init_individual() for _ in range(population_size)]
+    best_history = []
+    best_individual = None
+    best_fit = float("inf")
+
+    for _ in range(generations):
+        fitness_scores = np.array([fitness(ind) for ind in population])
+        best_idx = int(np.argmin(fitness_scores))
+        if fitness_scores[best_idx] < best_fit:
+            best_fit = float(fitness_scores[best_idx])
+            best_individual = population[best_idx].copy()
+        best_history.append(best_fit)
+
+        # Selection (tournament)
+        selected = []
+        for _ in range(population_size):
+            i, j = rng.integers(0, population_size, size=2)
+            winner = population[i] if fitness_scores[i] < fitness_scores[j] else population[j]
+            selected.append(winner.copy())
+
+        # Crossover
+        next_population = []
+        for i in range(0, population_size, 2):
+            parent1 = selected[i]
+            parent2 = selected[(i + 1) % population_size]
+            if rng.random() < 0.7:
+                point = rng.integers(1, gene_len - 1)
+                child1 = np.concatenate([parent1[:point], parent2[point:]])
+                child2 = np.concatenate([parent2[:point], parent1[point:]])
+            else:
+                child1, child2 = parent1.copy(), parent2.copy()
+            next_population.extend([child1, child2])
+
+        # Mutation
+        for idx in range(len(next_population)):
+            if rng.random() < 0.2:
+                mutate_idx = rng.integers(0, gene_len)
+                noise = rng.normal(0, discharge_power * 0.1)
+                next_population[idx][mutate_idx] = np.clip(
+                    next_population[idx][mutate_idx] + noise, 0, discharge_power
+                )
+
+        population = next_population[:population_size]
+
+    best_dispatch = simulate_dispatch(
+        load, solar, battery_cap, charge_power, discharge_power,
+        init_soc, final_soc, diesel_power_max, discharge_schedule=best_individual
+    )
+    best_cost, best_emissions = evaluate_dispatch_costs(best_dispatch, cost_factors, emission_factors)
+
+    return best_dispatch, best_cost, best_emissions, best_history
+
+
+def build_grid_topology_plot(flows, metadata):
+    """Build a Plotly figure showing power flow topology."""
+    graph = nx.DiGraph()
+
+    sources = ["Solar Panel", "Battery Storage", "Diesel Generator", "Grid Import"]
+    sink = "Load Demand"
+
+    for source in sources:
+        graph.add_edge(source, sink, weight=flows.get(source, 0.0))
+
+    pos = nx.spring_layout(graph, seed=7)
+
+    edge_traces = []
+    max_flow = max(flows.values()) if flows else 1.0
+    max_flow = max(max_flow, 1e-6)
+
+    edge_colors = {
+        "Solar Panel": "#ffcc00",
+        "Battery Storage": "#2ca02c",
+        "Diesel Generator": "#d62728",
+        "Grid Import": "#1f77b4",
+    }
+
+    for source, target, data in graph.edges(data=True):
+        x0, y0 = pos[source]
+        x1, y1 = pos[target]
+        flow = data.get("weight", 0.0)
+        width = 1.5 + 6.0 * (flow / max_flow)
+        edge_traces.append(
+            go.Scatter(
+                x=[x0, x1],
+                y=[y0, y1],
+                mode="lines",
+                line=dict(width=width, color=edge_colors.get(source, "#888")),
+                hoverinfo="text",
+                text=f"{source} → {target}<br>Flow: {flow:.2f} kW",
+                showlegend=False,
+            )
+        )
+
+    node_x = []
+    node_y = []
+    node_text = []
+    node_hover = []
+
+    for node in graph.nodes():
+        x, y = pos[node]
+        node_x.append(x)
+        node_y.append(y)
+        node_text.append(node)
+        meta = metadata.get(node, {})
+        hover = (
+            f"{node}<br>Capacity: {meta.get('capacity', 'N/A')} kW"
+            f"<br>Output: {meta.get('output', 0.0):.2f} kW"
+            f"<br>Cost: {meta.get('cost', 'N/A')} £/kWh"
+        )
+        node_hover.append(hover)
+
+    node_trace = go.Scatter(
+        x=node_x,
+        y=node_y,
+        mode="markers+text",
+        text=node_text,
+        textposition="bottom center",
+        hoverinfo="text",
+        hovertext=node_hover,
+        marker=dict(size=22, color="#f2f2f2", line=dict(width=1.5, color="#333"))
+    )
+
+    fig = go.Figure(data=edge_traces + [node_trace])
+    fig.update_layout(
+        title="Optimal Power Flow — Current Dispatch",
+        showlegend=False,
+        xaxis=dict(showgrid=False, zeroline=False, visible=False),
+        yaxis=dict(showgrid=False, zeroline=False, visible=False),
+        height=420,
+        margin=dict(l=20, r=20, t=50, b=20)
+    )
+
+    return fig
+
+
+def solve_horizon_lp(load, solar, price, battery_cap, charge_power, discharge_power,
+                     init_soc, final_soc_required):
+    """Solve a short-horizon LP and return the first-hour decisions."""
+    horizon = len(load)
+    steps = list(range(horizon))
+    prob = pulp.LpProblem("Rolling_Horizon", pulp.LpMinimize)
+
+    grid = {t: pulp.LpVariable(f"rh_grid_{t}", lowBound=0, cat='Continuous') for t in steps}
+    charge = {t: pulp.LpVariable(f"rh_charge_{t}", lowBound=0, cat='Continuous') for t in steps}
+    discharge = {t: pulp.LpVariable(f"rh_discharge_{t}", lowBound=0, cat='Continuous') for t in steps}
+    soc = {t: pulp.LpVariable(f"rh_soc_{t}", lowBound=0, upBound=battery_cap, cat='Continuous') for t in steps}
+
+    prob += pulp.lpSum(price[t] * grid[t] for t in steps), "Rolling_Cost"
+
+    for t in steps:
+        prob += (
+            grid[t] + discharge[t] + solar[t] == load[t] + charge[t],
+            f"rh_energy_balance_{t}"
+        )
+        if t < horizon - 1:
+            prob += (
+                soc[t+1] == soc[t] + CHARGE_EFFICIENCY * charge[t]
+                - (1 / DISCHARGE_EFFICIENCY) * discharge[t],
+                f"rh_soc_transition_{t}"
+            )
+        prob += (charge[t] <= charge_power, f"rh_charge_limit_{t}")
+        prob += (discharge[t] <= discharge_power, f"rh_discharge_limit_{t}")
+
+    prob += (soc[0] == init_soc * battery_cap, "rh_initial_soc")
+    if final_soc_required:
+        prob += (soc[horizon - 1] >= final_soc_required * battery_cap, "rh_final_soc")
+
+    solver = pulp.PULP_CBC_CMD(msg=0, timeLimit=30)
+    prob.solve(solver)
+
+    if pulp.LpStatus[prob.status] != "Optimal":
+        return None
+
+    grid0 = pulp.value(grid[0])
+    charge0 = pulp.value(charge[0])
+    discharge0 = pulp.value(discharge[0])
+    soc_next = init_soc * battery_cap + CHARGE_EFFICIENCY * charge0 - (1 / DISCHARGE_EFFICIENCY) * discharge0
+
+    return {
+        "grid": grid0,
+        "charge": charge0,
+        "discharge": discharge0,
+        "soc_next": soc_next
+    }
+
+
+def run_rolling_horizon(load, solar, price, battery_cap, charge_power, discharge_power,
+                        init_soc, final_soc, horizon_len=3):
+    """Run a receding horizon simulation over 24 hours."""
+    soc = init_soc * battery_cap
+    hourly_costs = []
+    grid_schedule = []
+
+    for t in TIME_STEPS:
+        end = min(t + horizon_len, HOURS)
+        load_window = load[t:end]
+        solar_window = solar[t:end]
+        price_window = price[t:end]
+        final_required = final_soc if end == HOURS else None
+
+        result = solve_horizon_lp(
+            load_window,
+            solar_window,
+            price_window,
+            battery_cap,
+            charge_power,
+            discharge_power,
+            soc / battery_cap,
+            final_required
+        )
+
+        if result is None:
+            hourly_costs.append(np.nan)
+            grid_schedule.append(0.0)
+            continue
+
+        grid_t = result["grid"]
+        grid_schedule.append(grid_t)
+        hourly_costs.append(grid_t * price[t])
+        soc = np.clip(result["soc_next"], 0.0, battery_cap)
+
+    return {
+        "hourly_costs": np.array(hourly_costs),
+        "total_cost": float(np.nansum(hourly_costs)),
+        "grid": np.array(grid_schedule)
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 4: STREAMLIT DASHBOARD
 # ─────────────────────────────────────────────────────────────────────────────
@@ -321,6 +720,31 @@ def main():
     
     demand_scale = st.sidebar.slider("Load Demand Scale", 0.5, 2.0, 1.0, 0.1)
     price_scale = st.sidebar.slider("Price Scale", 0.5, 2.0, 1.0, 0.1)
+
+    with st.sidebar.expander("View Full Mathematical Model"):
+        st.markdown("**Decision Variables**")
+        st.markdown("- $x_s(t)$ = solar output at hour $t$ (kW)")
+        st.markdown("- $x_b(t)$ = battery discharge at hour $t$ (kW)")
+        st.markdown("- $x_d(t)$ = diesel output at hour $t$ (kW)")
+
+        st.markdown("**Objective Function**")
+        st.latex(r"\min \sum_t [c_s\cdot x_s(t) + c_b\cdot x_b(t) + c_d\cdot x_d(t)]")
+
+        st.markdown("**Constraints**")
+        st.latex(r"x_s(t) + x_b(t) + x_d(t) = D(t)")
+        st.latex(r"0 \le x_i(t) \le X_{i,\max}")
+        st.latex(r"SoC(t+1) = SoC(t) - x_b(t)\cdot \Delta t")
+
+        params_df = pd.DataFrame([
+            {"Parameter": "Solar cost (c_s)", "Value": f"£{SOLAR_COST_PER_KWH:.2f}/kWh"},
+            {"Parameter": "Battery cost (c_b)", "Value": f"£{BATTERY_COST_PER_KWH:.2f}/kWh"},
+            {"Parameter": "Diesel cost (c_d)", "Value": f"£{DIESEL_COST_PER_KWH:.2f}/kWh"},
+            {"Parameter": "Solar capacity", "Value": f"{SOLAR_CAPACITY_KWP:.1f} kW"},
+            {"Parameter": "Battery discharge cap", "Value": f"{discharge_power:.1f} kW"},
+            {"Parameter": "Diesel capacity", "Value": f"{MAX_DIESEL_POWER_KW:.1f} kW"},
+        ])
+        st.markdown("**Current Parameters**")
+        st.dataframe(params_df, use_container_width=True)
     
     # SOLVE
     load_adjusted = LOAD_DEMAND * demand_scale
@@ -339,8 +763,8 @@ def main():
     )
     
     # TABS
-    tab_overview, tab_equations, tab_profiles, tab_analysis = st.tabs(
-        ["📈 System Overview", "⚡ Mathematical Model", "📊 Profiles", "💡 Insights"]
+    tab_overview, tab_equations, tab_profiles, tab_analysis, tab_multi, tab_solver, tab_compare, tab_sensitivity, tab_rolling = st.tabs(
+        ["📈 System Overview", "⚡ Mathematical Model", "📊 Profiles", "💡 Insights", "🎯 Multi-Objective Optimization", "🧠 Solver Insights", "⚖️ Algorithm Comparison", "🧪 Sensitivity Analysis", "⏳ Rolling Horizon Simulation"]
     )
     
     # ──────────────────────────────────────────────────────────────────────────
@@ -386,6 +810,49 @@ def main():
             
             st.markdown("### Hourly Dispatch Schedule")
             st.dataframe(results_df, use_container_width=True, height=400)
+
+            st.markdown("### Grid Topology")
+            avg_grid = np.mean([results_opt['grid'][t] for t in TIME_STEPS])
+            avg_battery = np.mean([results_opt['discharge'][t] for t in TIME_STEPS])
+            avg_solar = np.mean(SOLAR_GENERATION)
+
+            flows = {
+                "Solar Panel": avg_solar,
+                "Battery Storage": avg_battery,
+                "Diesel Generator": 0.0,
+                "Grid Import": avg_grid,
+            }
+
+            metadata = {
+                "Solar Panel": {
+                    "capacity": SOLAR_CAPACITY_KWP,
+                    "output": avg_solar,
+                    "cost": SOLAR_COST_PER_KWH,
+                },
+                "Battery Storage": {
+                    "capacity": discharge_power,
+                    "output": avg_battery,
+                    "cost": BATTERY_COST_PER_KWH,
+                },
+                "Diesel Generator": {
+                    "capacity": MAX_DIESEL_POWER_KW,
+                    "output": 0.0,
+                    "cost": DIESEL_COST_PER_KWH,
+                },
+                "Grid Import": {
+                    "capacity": "Unlimited",
+                    "output": avg_grid,
+                    "cost": f"{np.mean(price_adjusted):.2f}",
+                },
+                "Load Demand": {
+                    "capacity": load_adjusted.max(),
+                    "output": np.mean(load_adjusted),
+                    "cost": "N/A",
+                },
+            }
+
+            fig_topology = build_grid_topology_plot(flows, metadata)
+            st.plotly_chart(fig_topology, use_container_width=True)
             
         else:
             st.error(f"Solver Status: {results_opt['status']}")
@@ -654,6 +1121,529 @@ soc[t] = pulp.LpVariable(f"soc_{t}", lowBound=0, upBound=battery_cap, cat='Conti
 
 **Battery is economically justified.**
             """)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # TAB 6: SOLVER INSIGHTS
+    # ──────────────────────────────────────────────────────────────────────────
+
+    with tab_solver:
+        st.markdown("## Solver Insights")
+        st.markdown("Inspect dual values and binding constraints from the LP solution.")
+
+        with st.expander("What are shadow prices?", expanded=False):
+            st.write(
+                "Shadow prices (dual values) show how the objective would change if a constraint "
+                "were relaxed by 1 kW. For a microgrid operator, this indicates the marginal value "
+                "of extra capacity or flexibility at the optimum."
+            )
+
+        if results_opt['status'] != 'Optimal':
+            st.warning("Solver insights are available only for an optimal solution.")
+        else:
+            constraints = prob_obj.constraints
+            insight_rows = []
+            binding_rows = []
+            tol = 1e-6
+
+            for name, constraint in constraints.items():
+                dual = getattr(constraint, "pi", None)
+                slack = getattr(constraint, "slack", None)
+                is_binding = False
+                if slack is not None:
+                    is_binding = abs(slack) <= tol
+
+                insight_rows.append({
+                    "Constraint": name,
+                    "Shadow Price": dual,
+                    "Slack": slack,
+                    "Binding": is_binding
+                })
+
+                if is_binding:
+                    savings = None if dual is None else -dual
+                    binding_rows.append({
+                        "Constraint": name,
+                        "Shadow Price": dual,
+                        "Relaxing by 1 kW saves (₹/hour)": savings
+                    })
+
+            st.markdown("### Shadow Prices (Dual Variables)")
+            st.dataframe(pd.DataFrame(insight_rows), use_container_width=True)
+
+            st.markdown("### Binding Constraints")
+            st.dataframe(pd.DataFrame(binding_rows), use_container_width=True)
+
+            st.markdown("### Simplex Iterations")
+            st.write("Not available from CBC via PuLP. Use a solver that exposes iterations if needed.")
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # TAB 7: ALGORITHM COMPARISON
+    # ──────────────────────────────────────────────────────────────────────────
+
+    with tab_compare:
+        st.markdown("## Algorithm Comparison")
+        st.markdown("Compare greedy dispatch vs. genetic algorithm optimization on the same profile.")
+
+        if st.button("Run Comparison"):
+            cost_factors = {
+                "solar": SOLAR_COST_PER_KWH,
+                "battery": BATTERY_COST_PER_KWH,
+                "diesel": DIESEL_COST_PER_KWH,
+            }
+            emission_factors = {
+                "solar": SOLAR_EMISSIONS_KG_PER_KWH,
+                "battery": BATTERY_EMISSIONS_KG_PER_KWH,
+                "diesel": DIESEL_EMISSIONS_KG_PER_KWH,
+            }
+
+            greedy_dispatch = simulate_dispatch(
+                load_adjusted,
+                SOLAR_GENERATION,
+                battery_cap,
+                charge_power,
+                discharge_power,
+                init_soc,
+                final_soc,
+                MAX_DIESEL_POWER_KW
+            )
+            greedy_cost, greedy_emissions = evaluate_dispatch_costs(
+                greedy_dispatch, cost_factors, emission_factors
+            )
+
+            ga_dispatch, ga_cost, ga_emissions, ga_history = run_ga_dispatch(
+                load_adjusted,
+                SOLAR_GENERATION,
+                battery_cap,
+                charge_power,
+                discharge_power,
+                init_soc,
+                final_soc,
+                MAX_DIESEL_POWER_KW,
+                cost_factors,
+                emission_factors
+            )
+
+            st.session_state["compare_results"] = {
+                "greedy": {
+                    "dispatch": greedy_dispatch,
+                    "cost": greedy_cost,
+                    "emissions": greedy_emissions,
+                    "reliability": greedy_dispatch["reliability"],
+                },
+                "ga": {
+                    "dispatch": ga_dispatch,
+                    "cost": ga_cost,
+                    "emissions": ga_emissions,
+                    "reliability": ga_dispatch["reliability"],
+                    "history": ga_history,
+                },
+            }
+
+        compare_results = st.session_state.get("compare_results")
+        if not compare_results:
+            st.info("Click 'Run Comparison' to execute the algorithms.")
+        else:
+            col_left, col_right = st.columns(2)
+            with col_left:
+                st.metric("Greedy Total Cost", f"£{compare_results['greedy']['cost']:.2f}")
+            with col_right:
+                st.metric("GA Total Cost", f"£{compare_results['ga']['cost']:.2f}")
+
+            fig_greedy = go.Figure()
+            fig_greedy.add_trace(go.Bar(
+                x=TIME_STEPS,
+                y=compare_results["greedy"]["dispatch"]["solar_use"],
+                name="Solar",
+                marker_color="#ff7f0e"
+            ))
+            fig_greedy.add_trace(go.Bar(
+                x=TIME_STEPS,
+                y=compare_results["greedy"]["dispatch"]["battery_discharge"],
+                name="Battery",
+                marker_color="#2ca02c"
+            ))
+            fig_greedy.add_trace(go.Bar(
+                x=TIME_STEPS,
+                y=compare_results["greedy"]["dispatch"]["diesel_use"],
+                name="Diesel",
+                marker_color="#d62728"
+            ))
+            fig_greedy.update_layout(
+                barmode="stack",
+                title="Greedy Dispatch (kW)",
+                xaxis_title="Hour",
+                yaxis_title="Power (kW)",
+                height=350
+            )
+            st.plotly_chart(fig_greedy, use_container_width=True)
+
+            fig_ga = go.Figure()
+            fig_ga.add_trace(go.Bar(
+                x=TIME_STEPS,
+                y=compare_results["ga"]["dispatch"]["solar_use"],
+                name="Solar",
+                marker_color="#ff7f0e"
+            ))
+            fig_ga.add_trace(go.Bar(
+                x=TIME_STEPS,
+                y=compare_results["ga"]["dispatch"]["battery_discharge"],
+                name="Battery",
+                marker_color="#2ca02c"
+            ))
+            fig_ga.add_trace(go.Bar(
+                x=TIME_STEPS,
+                y=compare_results["ga"]["dispatch"]["diesel_use"],
+                name="Diesel",
+                marker_color="#d62728"
+            ))
+            fig_ga.update_layout(
+                barmode="stack",
+                title="GA Dispatch (kW)",
+                xaxis_title="Hour",
+                yaxis_title="Power (kW)",
+                height=350
+            )
+            st.plotly_chart(fig_ga, use_container_width=True)
+
+            fig_conv = go.Figure()
+            fig_conv.add_trace(go.Scatter(
+                x=list(range(1, len(compare_results["ga"]["history"]) + 1)),
+                y=compare_results["ga"]["history"],
+                mode="lines+markers",
+                name="Best Fitness",
+                line=dict(color="#1f77b4")
+            ))
+            fig_conv.update_layout(
+                title="GA Convergence Curve",
+                xaxis_title="Generation",
+                yaxis_title="Best Fitness (Cost + Penalty)",
+                height=350
+            )
+            st.plotly_chart(fig_conv, use_container_width=True)
+
+            summary_df = pd.DataFrame([
+                {
+                    "Method": "Greedy",
+                    "Cost": compare_results["greedy"]["cost"],
+                    "Emissions": compare_results["greedy"]["emissions"],
+                    "Reliability (%)": compare_results["greedy"]["reliability"],
+                },
+                {
+                    "Method": "Genetic Algorithm",
+                    "Cost": compare_results["ga"]["cost"],
+                    "Emissions": compare_results["ga"]["emissions"],
+                    "Reliability (%)": compare_results["ga"]["reliability"],
+                },
+            ])
+            st.markdown("### Summary")
+            st.dataframe(summary_df, use_container_width=True)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # TAB 8: SENSITIVITY ANALYSIS
+    # ──────────────────────────────────────────────────────────────────────────
+
+    with tab_sensitivity:
+        st.markdown("## What-If Decision Tool")
+        st.write("Used by energy managers to stress-test dispatch plans.")
+
+        solar_change = st.slider(
+            "Solar Capacity Change (%)",
+            min_value=-50,
+            max_value=50,
+            value=0,
+            step=5
+        )
+        diesel_change = st.slider(
+            "Diesel Cost Change (%)",
+            min_value=-50,
+            max_value=50,
+            value=0,
+            step=5
+        )
+
+        base_cost_factors = {
+            "solar": SOLAR_COST_PER_KWH,
+            "battery": BATTERY_COST_PER_KWH,
+            "diesel": DIESEL_COST_PER_KWH,
+        }
+        base_emission_factors = {
+            "solar": SOLAR_EMISSIONS_KG_PER_KWH,
+            "battery": BATTERY_EMISSIONS_KG_PER_KWH,
+            "diesel": DIESEL_EMISSIONS_KG_PER_KWH,
+        }
+
+        base_results = solve_multiobjective_dispatch(
+            load_adjusted,
+            SOLAR_GENERATION,
+            battery_cap,
+            charge_power,
+            discharge_power,
+            init_soc,
+            final_soc,
+            1.0,
+            MAX_DIESEL_POWER_KW,
+            base_cost_factors,
+            base_emission_factors
+        )
+
+        solar_scale = 1.0 + (solar_change / 100.0)
+        diesel_scale = 1.0 + (diesel_change / 100.0)
+        adjusted_solar = SOLAR_GENERATION * solar_scale
+        adjusted_cost_factors = {
+            "solar": SOLAR_COST_PER_KWH,
+            "battery": BATTERY_COST_PER_KWH,
+            "diesel": DIESEL_COST_PER_KWH * diesel_scale,
+        }
+
+        new_results = solve_multiobjective_dispatch(
+            load_adjusted,
+            adjusted_solar,
+            battery_cap,
+            charge_power,
+            discharge_power,
+            init_soc,
+            final_soc,
+            1.0,
+            MAX_DIESEL_POWER_KW,
+            adjusted_cost_factors,
+            base_emission_factors
+        )
+
+        if base_results["status"] != "Optimal" or new_results["status"] != "Optimal":
+            st.warning("Sensitivity results unavailable due to non-optimal solution.")
+        else:
+            base_cost = base_results["cost"]
+            new_cost = new_results["cost"]
+            delta_cost = new_cost - base_cost
+            delta_pct = (delta_cost / base_cost * 100) if base_cost else 0.0
+
+            st.metric(
+                "Optimal Cost Change",
+                f"₹{new_cost:.2f}",
+                f"₹{delta_cost:.2f} ({delta_pct:.1f}%)"
+            )
+
+            base_solar = np.sum([base_results["solar_use"][t] for t in TIME_STEPS])
+            base_battery = np.sum([base_results["discharge"][t] for t in TIME_STEPS])
+            base_diesel = np.sum([base_results["diesel"][t] for t in TIME_STEPS])
+            total_supply = base_solar + base_battery + base_diesel
+
+            fig_pie = go.Figure(data=[go.Pie(
+                labels=["Solar", "Battery", "Diesel"],
+                values=[base_solar, base_battery, base_diesel],
+                hole=0.4
+            )])
+            fig_pie.update_layout(title="New Dispatch Mix (Energy Share)")
+            st.plotly_chart(fig_pie, use_container_width=True)
+
+            sensitivity_df = pd.DataFrame([
+                {
+                    "Parameter Changed": "Solar Capacity",
+                    "Original Value": f"{SOLAR_CAPACITY_KWP:.1f} kWp",
+                    "New Value": f"{SOLAR_CAPACITY_KWP * solar_scale:.1f} kWp",
+                    "Cost Impact (₹)": f"{delta_cost:.2f}",
+                },
+                {
+                    "Parameter Changed": "Diesel Cost",
+                    "Original Value": f"£{DIESEL_COST_PER_KWH:.2f}/kWh",
+                    "New Value": f"£{DIESEL_COST_PER_KWH * diesel_scale:.2f}/kWh",
+                    "Cost Impact (₹)": f"{delta_cost:.2f}",
+                },
+            ])
+            st.markdown("### Sensitivity Table")
+            st.dataframe(sensitivity_df, use_container_width=True)
+
+            tornado_values = [
+                ("Solar Capacity", abs(delta_cost)),
+                ("Diesel Cost", abs(delta_cost)),
+            ]
+            tornado_df = pd.DataFrame(tornado_values, columns=["Parameter", "Impact"])
+            fig_tornado = go.Figure(go.Bar(
+                x=tornado_df["Impact"],
+                y=tornado_df["Parameter"],
+                orientation="h",
+                marker_color="#1f77b4"
+            ))
+            fig_tornado.update_layout(
+                title="Tornado Chart: Cost Impact",
+                xaxis_title="Absolute Cost Impact (₹)",
+                yaxis_title="Parameter",
+                height=300
+            )
+            st.plotly_chart(fig_tornado, use_container_width=True)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # TAB 9: ROLLING HORIZON SIMULATION
+    # ──────────────────────────────────────────────────────────────────────────
+
+    with tab_rolling:
+        st.markdown("## Rolling Horizon Simulation")
+        st.text_area(
+            "Explanation",
+            value="Real-world energy systems use rolling horizon because future demand is uncertain.",
+            height=80
+        )
+
+        if results_opt['status'] != 'Optimal':
+            st.warning("Rolling horizon comparison requires an optimal baseline solution.")
+        else:
+            perfect_hourly = price_adjusted * np.array([results_opt['grid'][t] for t in TIME_STEPS])
+            perfect_cost = results_opt['objective']
+
+            rolling_results = run_rolling_horizon(
+                load_adjusted,
+                SOLAR_GENERATION,
+                price_adjusted,
+                battery_cap,
+                charge_power,
+                discharge_power,
+                init_soc,
+                final_soc,
+                horizon_len=3
+            )
+
+            rolling_cost = rolling_results["total_cost"]
+            gap_pct = ((rolling_cost - perfect_cost) / perfect_cost * 100) if perfect_cost else 0.0
+
+            fig_roll = go.Figure()
+            fig_roll.add_trace(go.Scatter(
+                x=TIME_STEPS,
+                y=perfect_hourly,
+                mode="lines+markers",
+                name="Perfect Foresight",
+                line=dict(color="#1f77b4")
+            ))
+            fig_roll.add_trace(go.Scatter(
+                x=TIME_STEPS,
+                y=rolling_results["hourly_costs"],
+                mode="lines+markers",
+                name="Rolling Horizon",
+                line=dict(color="#ff7f0e")
+            ))
+            fig_roll.update_layout(
+                title="Hourly Cost Comparison",
+                xaxis_title="Hour",
+                yaxis_title="Cost (£)",
+                height=350
+            )
+            st.plotly_chart(fig_roll, use_container_width=True)
+
+            summary = pd.DataFrame([
+                {"Method": "Perfect Foresight", "Total Cost": perfect_cost},
+                {"Method": "Rolling Horizon", "Total Cost": rolling_cost},
+                {"Method": "Optimality Gap", "Total Cost": f"{gap_pct:.2f}%"},
+            ])
+            st.markdown("### Total Daily Cost")
+            st.dataframe(summary, use_container_width=True)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # TAB 5: MULTI-OBJECTIVE OPTIMIZATION
+    # ──────────────────────────────────────────────────────────────────────────
+
+    with tab_multi:
+        st.markdown("## Multi-Objective Optimization")
+        st.markdown("Explore the trade-off between cost and emissions using a weighted objective.")
+
+        alpha = st.slider(
+            "Cost vs. Green Priority",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.5,
+            step=0.05
+        )
+
+        cost_factors = {
+            "solar": SOLAR_COST_PER_KWH,
+            "battery": BATTERY_COST_PER_KWH,
+            "diesel": DIESEL_COST_PER_KWH,
+        }
+        emission_factors = {
+            "solar": SOLAR_EMISSIONS_KG_PER_KWH,
+            "battery": BATTERY_EMISSIONS_KG_PER_KWH,
+            "diesel": DIESEL_EMISSIONS_KG_PER_KWH,
+        }
+
+        pareto_alphas = np.linspace(0, 1, 20)
+        pareto_costs = []
+        pareto_emissions = []
+
+        for a in pareto_alphas:
+            res = solve_multiobjective_dispatch(
+                load_adjusted,
+                SOLAR_GENERATION,
+                battery_cap,
+                charge_power,
+                discharge_power,
+                init_soc,
+                final_soc,
+                float(a),
+                MAX_DIESEL_POWER_KW,
+                cost_factors,
+                emission_factors
+            )
+            pareto_costs.append(res["cost"])
+            pareto_emissions.append(res["emissions"])
+
+        selected = solve_multiobjective_dispatch(
+            load_adjusted,
+            SOLAR_GENERATION,
+            battery_cap,
+            charge_power,
+            discharge_power,
+            init_soc,
+            final_soc,
+            alpha,
+            MAX_DIESEL_POWER_KW,
+            cost_factors,
+            emission_factors
+        )
+
+        fig_pareto = go.Figure()
+        fig_pareto.add_trace(go.Scatter(
+            x=pareto_emissions,
+            y=pareto_costs,
+            mode="markers+lines",
+            name="Pareto Front",
+            marker=dict(color="#1f77b4", size=8),
+            hovertemplate="Emissions: %{x:.2f} kg<br>Cost: £%{y:.2f}<extra></extra>"
+        ))
+        fig_pareto.add_trace(go.Scatter(
+            x=[selected["emissions"]],
+            y=[selected["cost"]],
+            mode="markers",
+            name="Selected alpha",
+            marker=dict(color="red", size=12),
+            hovertemplate="Selected<br>Emissions: %{x:.2f} kg<br>Cost: £%{y:.2f}<extra></extra>"
+        ))
+        fig_pareto.update_layout(
+            title="Cost vs Emissions Trade-off",
+            xaxis_title="Total Emissions (kg CO2)",
+            yaxis_title="Total Cost (£)",
+            height=450
+        )
+        st.plotly_chart(fig_pareto, use_container_width=True)
+
+        if selected["status"] != "Optimal":
+            st.error(f"Solver Status: {selected['status']}")
+        else:
+            total_solar = np.sum([selected["solar_use"][t] for t in TIME_STEPS])
+            total_battery = np.sum([selected["discharge"][t] for t in TIME_STEPS])
+            total_diesel = np.sum([selected["diesel"][t] for t in TIME_STEPS])
+
+            fig_dispatch = go.Figure(data=[
+                go.Bar(
+                    x=["Solar", "Battery", "Diesel"],
+                    y=[total_solar, total_battery, total_diesel],
+                    marker_color=["#ff7f0e", "#2ca02c", "#d62728"]
+                )
+            ])
+            fig_dispatch.update_layout(
+                title="Optimal Dispatch Breakdown (kWh)",
+                xaxis_title="Source",
+                yaxis_title="Energy (kWh)",
+                height=350
+            )
+            st.plotly_chart(fig_dispatch, use_container_width=True)
 
 
 if __name__ == "__main__":
